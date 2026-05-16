@@ -38,6 +38,7 @@ import shlex
 import signal
 import socket
 import subprocess
+from terminal_cwd import get_terminal_cwd
 import sys
 import tempfile
 import threading
@@ -1628,7 +1629,7 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     """
     if mode != "project":
         return staging_dir
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    raw = (get_terminal_cwd("") or "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 from toolsets import TOOLSETS
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from terminal_cwd import get_terminal_cwd
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -645,7 +646,7 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     guessing `/workspace/...` for local repo tasks.
     """
     candidates = [
-        os.getenv("TERMINAL_CWD"),
+        get_terminal_cwd(),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
         ),

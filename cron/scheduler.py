@@ -694,7 +694,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, cwd: str | None = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -716,6 +716,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        cwd: Optional subprocess working directory for scripts that need
+            project-relative paths.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -774,13 +776,24 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     else:
         argv = [sys.executable, str(path)]
 
+    script_cwd = path.parent
+    if cwd:
+        cwd_path = Path(cwd).expanduser()
+        if cwd_path.is_dir():
+            script_cwd = cwd_path.resolve()
+        else:
+            logger.warning(
+                "Ignoring cron script cwd %r because it is not a directory",
+                cwd,
+            )
+
     try:
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=str(script_cwd),
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -835,7 +848,11 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    script_cwd: str | None = None,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -845,6 +862,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        script_cwd: Optional subprocess working directory when the script
+            runs inline.
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
@@ -855,7 +874,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, cwd=script_cwd)
         if success:
             if script_output:
                 prompt = (
@@ -1019,6 +1038,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _job_workdir = (job.get("workdir") or "").strip() or None
+    if _job_workdir and not Path(_job_workdir).is_dir():
+        # Directory was removed between create-time validation and now. Log
+        # and drop back to old behavior rather than crashing the job.
+        logger.warning(
+            "Job '%s': configured workdir %r no longer exists — running without it",
+            job_id,
+            _job_workdir,
+        )
+        _job_workdir = None
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -1045,26 +1074,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
-        # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
-
-        try:
-            ok, output = _run_job_script(script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        # Apply workdir as the subprocess cwd without mutating process-global
+        # os.getcwd(), so no_agent jobs are safe to run beside other cron jobs.
+        ok, output = _run_job_script(script_path, cwd=_job_workdir)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1147,7 +1159,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, cwd=_job_workdir)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -1163,7 +1175,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            script_cwd=_job_workdir,
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -1241,28 +1257,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory.  When set (and validated at create/update
-    # time), we point TERMINAL_CWD at it so:
+    # Per-job working directory. When set (and validated at create/update
+    # time), we scope the terminal cwd to this cron execution so:
     #   - build_context_files_prompt() picks up AGENTS.md / CLAUDE.md /
     #     .cursorrules from the job's project dir, AND
     #   - the terminal, file, and code-exec tools run commands from there.
     #
-    # tick() serializes workdir-jobs outside the parallel pool, so mutating
-    # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
-    # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    _job_workdir = (job.get("workdir") or "").strip() or None
-    if _job_workdir and not Path(_job_workdir).is_dir():
-        # Directory was removed between create-time validation and now.  Log
-        # and drop back to old behaviour rather than crashing the job.
-        logger.warning(
-            "Job '%s': configured workdir %r no longer exists — running without it",
-            job_id, _job_workdir,
-        )
-        _job_workdir = None
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    # The scoped override is a ContextVar, not os.environ, because cron jobs
+    # can run in parallel inside one gateway process.
+    from terminal_cwd import set_terminal_cwd, reset_terminal_cwd
+
+    _terminal_cwd_token = None
     if _job_workdir:
-        os.environ["TERMINAL_CWD"] = _job_workdir
+        _terminal_cwd_token = set_terminal_cwd(_job_workdir)
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
     try:
@@ -1614,14 +1621,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+        # Restore the per-job cwd ContextVar. The process environment was
+        # never mutated, so parallel cron jobs cannot clobber one another.
+        if _terminal_cwd_token is not None:
+            reset_terminal_cwd(_terminal_cwd_token)
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
@@ -1770,28 +1773,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 mark_job_run(job["id"], False, str(e))
                 return False
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
-        # so they MUST run sequentially to avoid corrupting each other.  Jobs
-        # without a workdir leave env untouched and stay parallel-safe.
-        workdir_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
-
         _results: list = []
-
-        # Sequential pass for workdir jobs.
-        for job in workdir_jobs:
-            _ctx = contextvars.copy_context()
-            _results.append(_ctx.run(_process_job, job))
-
-        # Parallel pass for the rest — same behaviour as before.
-        if parallel_jobs:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
-                _futures = []
-                for job in parallel_jobs:
-                    _ctx = contextvars.copy_context()
-                    _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-                _results.extend(f.result() for f in _futures)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
+            _futures = []
+            for job in due_jobs:
+                _ctx = contextvars.copy_context()
+                _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
+            _results.extend(f.result() for f in _futures)
 
         # Best-effort sweep of MCP stdio subprocesses that survived their
         # session teardown during this tick.  Runs AFTER every job has
